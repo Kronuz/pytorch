@@ -35,6 +35,7 @@ from ..source import (
     GetItemSource,
     GlobalWeakRefSource,
     is_constant_source,
+    is_from_local_source,
     LocalSource,
     RandomValueSource,
     Source,
@@ -197,9 +198,46 @@ class VariableBuilder:
 
     def __call__(self, value):
         if value in self.tx.output.side_effects:
-            # TODO(jansel): add guard for alias relationship
-            return self.tx.output.side_effects[value]
-        return self._wrap(value).clone(**self.options())
+            side_effect_result = self.tx.output.side_effects[value]
+            # Note - we may end up in a situation where we invoke something like
+            # def fn(x, y)
+            # with fn(x, x)
+            # Prior to the addition of tracking to all input objects, we would handle this just fine by
+            # eagerly re-entering VB and rewrapping inputs, correctly creating graphargs and placeholders. However,
+            # with tracking on inputs, we do not produce deduping guard correctly, and duplicate inputs or aliased
+            # relationships may end up getting erased here - the fn(x, x) call above, with side effects, would
+            # look like a graph with a single input (not necessarily incorrectly so).
+
+            # Note - we may not have a source, that is fine, it just means we had an object that is safe to have
+            # leave unsourced - like a local list created and discharged entirely within a local scope.
+            if side_effect_result.source and side_effect_result.source != self.source:
+                ser_source_is_local = is_from_local_source(side_effect_result.source)
+                source_is_local = is_from_local_source(self.source)
+                # Note - both must be local, or global, or we will run afoul of a lack of merging in how we currently
+                # reconcile guards builder scopes in compile_check_fn. This technically means we miss a guard here,
+                # so maybe we should do this refactor before we land this...
+                # TODO(voz): Combine local and global guard builders.
+                if ser_source_is_local == source_is_local:
+                    dup_guard = functools.partial(
+                        GuardBuilder.DUPLICATE_INPUT, source_b=side_effect_result.source
+                    )
+                    side_effect_result = side_effect_result.add_guards(
+                        self.make_guards(dup_guard)
+                    )
+            return side_effect_result
+        vt = self._wrap(value).clone(**self.options())
+        if self._can_lift_attrs_to_inputs(vt):
+            vt = self.tx.output.side_effects.track_object_existing(
+                self.source, value, vt
+            )
+        return vt
+
+    def _can_lift_attrs_to_inputs(self, vt):
+        if not is_from_local_source(self.source):
+            return False
+        if type(vt) in [TensorVariable, UserDefinedObjectVariable]:
+            return True
+        return False
 
     @staticmethod
     @functools.lru_cache(None)
